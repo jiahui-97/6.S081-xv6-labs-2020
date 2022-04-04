@@ -1,0 +1,12 @@
+# MIT6.S081 implementation - 2021
+- [x] Lab1 util: Xv6 and Unix utilities
+- [x] Lab2 syscall: System calls
+- [ ] Lab3 pgtbl: Page tables
+- [ ] Lab4 traps: Trap
+- [ ] Lab5 lazy: Lazy allocation
+- [ ] Lab6 cow: Copy-on-write fork
+- [ ] Lab7 thread: Multithreading
+- [ ] Lab8 lock: Parallelism/locking
+- [ ] Lab9 fs: File system
+- [ ] Lab10 mmap: Mmap
+- [ ] Lab11 net: Network stack
