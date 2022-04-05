@@ -21,6 +21,8 @@ static void freeproc(struct proc *p);
 
 extern char trampoline[]; // trampoline.S
 
+extern pagetable_t kernel_pagetable;
+
 // initialize the proc table at boot time.
 void
 procinit(void)
@@ -34,12 +36,12 @@ procinit(void)
       // Allocate a page for the process's kernel stack.
       // Map it high in memory, followed by an invalid
       // guard page.
-      char *pa = kalloc();
-      if(pa == 0)
-        panic("kalloc");
-      uint64 va = KSTACK((int) (p - proc));
-      kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
-      p->kstack = va;
+      // char *pa = kalloc();
+      // if(pa == 0)
+      //   panic("kalloc");
+      // uint64 va = KSTACK((int) (p - proc));
+      // kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
+      // p->kstack = va;
   }
   kvminithart();
 }
@@ -121,6 +123,22 @@ found:
     return 0;
   }
 
+  // 创建内核页表
+  p->kpagetable = proc_kpagetable(p);
+  if(p->kpagetable == 0){
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+
+  // 初始化内核栈，从procinit抄的
+  char *pa = kalloc();
+  if(pa == 0)
+    panic("kalloc");
+  uint64 va = KSTACK((int) (p - proc));
+  ukvmmap(p->kpagetable, va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
+  p->kstack = va;
+
   // Set up new context to start executing at forkret,
   // which returns to user space.
   memset(&p->context, 0, sizeof(p->context));
@@ -139,8 +157,18 @@ freeproc(struct proc *p)
   if(p->trapframe)
     kfree((void*)p->trapframe);
   p->trapframe = 0;
+
+  // 释放内核栈
+  pte_t *pte = walk(p->kpagetable, p->kstack, 0);
+  if(pte == 0)
+    panic("freeproc: free kstack");
+  kfree((void*)PTE2PA(*pte));
+  p->kstack = 0;
+
   if(p->pagetable)
     proc_freepagetable(p->pagetable, p->sz);
+  if(p->kpagetable)
+    proc_freekpagetable(p->kpagetable);
   p->pagetable = 0;
   p->sz = 0;
   p->pid = 0;
@@ -195,6 +223,43 @@ proc_freepagetable(pagetable_t pagetable, uint64 sz)
   uvmfree(pagetable, sz);
 }
 
+void
+proc_freekpagetable(pagetable_t kpagetable)
+{
+  for (int i = 0; i < 512; i++) {
+		pte_t pte = kpagetable[i];
+		if (pte & PTE_V) {
+			if ((pte & (PTE_R|PTE_W|PTE_X)) == 0) {
+				uint64 child = PTE2PA(pte);
+				proc_freekpagetable((pagetable_t)child);
+			}
+		}
+	}
+	kfree((void*)kpagetable);
+}
+
+// 创建内核页表，仿照kvminit
+extern char etext[];
+
+pagetable_t
+proc_kpagetable(struct proc *p) {
+  pagetable_t kpagetable;
+  kpagetable = uvmcreate();
+  if(kpagetable == 0)
+    return 0;
+
+  ukvmmap(kpagetable, UART0, UART0, PGSIZE, PTE_R | PTE_W);
+  ukvmmap(kpagetable, VIRTIO0, VIRTIO0, PGSIZE, PTE_R | PTE_W);
+  // ukvmmap(kpagetable, CLINT, CLINT, 0x10000, PTE_R | PTE_W);
+  ukvmmap(kpagetable, PLIC, PLIC, 0x400000, PTE_R | PTE_W);
+  ukvmmap(kpagetable, KERNBASE, KERNBASE, (uint64)etext-KERNBASE, PTE_R | PTE_X);
+  ukvmmap(kpagetable, (uint64)etext, (uint64)etext, PHYSTOP-(uint64)etext, PTE_R | PTE_W);
+  ukvmmap(kpagetable, TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);
+  ukvmmap(kpagetable, TRAPFRAME, (uint64)(p->trapframe), PGSIZE, PTE_R | PTE_W);
+
+  return kpagetable;
+}
+
 // a user program that calls exec("/init")
 // od -t xC initcode
 uchar initcode[] = {
@@ -221,6 +286,8 @@ userinit(void)
   uvminit(p->pagetable, initcode, sizeof(initcode));
   p->sz = PGSIZE;
 
+  ukvmcopy(p->pagetable, p->kpagetable, 0, p->sz);
+
   // prepare for the very first "return" from kernel to user.
   p->trapframe->epc = 0;      // user program counter
   p->trapframe->sp = PGSIZE;  // user stack pointer
@@ -243,11 +310,15 @@ growproc(int n)
 
   sz = p->sz;
   if(n > 0){
+    if (PGROUNDUP(sz + n) >= PLIC)
+      return -1;
     if((sz = uvmalloc(p->pagetable, sz, sz + n)) == 0) {
       return -1;
     }
+    ukvmcopy(p->pagetable, p->kpagetable, sz - n, sz);
   } else if(n < 0){
     sz = uvmdealloc(p->pagetable, sz, sz + n);
+    ukvmcopy(p->pagetable, p->kpagetable, sz, sz - n);
   }
   p->sz = sz;
   return 0;
@@ -274,6 +345,8 @@ fork(void)
     return -1;
   }
   np->sz = p->sz;
+
+  ukvmcopy(np->pagetable, np->kpagetable, 0, np->sz);
 
   np->parent = p;
 
@@ -473,6 +546,12 @@ scheduler(void)
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
+
+        // 切换内核页表
+        w_satp(MAKE_SATP(p->kpagetable));
+        // 刷新TLB
+        sfence_vma();
+
         swtch(&c->context, &p->context);
 
         // Process is done running for now.
@@ -485,6 +564,8 @@ scheduler(void)
     }
 #if !defined (LAB_FS)
     if(found == 0) {
+      w_satp(MAKE_SATP(kernel_pagetable));
+      sfence_vma();
       intr_on();
       asm volatile("wfi");
     }
